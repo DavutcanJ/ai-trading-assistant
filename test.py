@@ -13,7 +13,6 @@ from sklearn.preprocessing import MinMaxScaler
 import time
 from datetime import datetime, timedelta
 import logging
-import json
 
 # Load environment variables
 load_dotenv()
@@ -40,182 +39,56 @@ class TimeSeriesPredictor(Model):
         self.num_layers = num_layers
         self.num_heads = num_heads
         
-        # Input projections
-        self.input_projection = layers.Dense(hidden_size)
-        self.input_dropout = layers.Dropout(dropout)
+        # Input ve positional encoding
+        self.input_layer = layers.Dense(hidden_size)
+        self.pos_encoding = self._positional_encoding(hidden_size)
         
-        # Transformer blocks
-        self.transformer_blocks = []
+        # Transformer katmanları
+        self.transformer_layers = []
         for _ in range(num_layers):
-            self.transformer_blocks.append([
-                layers.LayerNormalization(epsilon=1e-6),
+            self.transformer_layers.append(
                 layers.MultiHeadAttention(
                     num_heads=num_heads,
                     key_dim=hidden_size // num_heads,
                     dropout=dropout
-                ),
-                layers.Dropout(dropout),
-                layers.LayerNormalization(epsilon=1e-6),
-                layers.Dense(hidden_size * 4, activation='relu'),
-                layers.Dropout(dropout),
-                layers.Dense(hidden_size)
-            ])
+                )
+            )
+            self.transformer_layers.append(layers.LayerNormalization())
+            self.transformer_layers.append(layers.Dropout(dropout))
+            
+        # Çıkış katmanı
+        self.output_layer = layers.Dense(4)  # 4 saat için tahmin
         
-        # Output layers - değiştirildi
-        self.output_norm = layers.LayerNormalization(epsilon=1e-6)
-        self.output_dropout = layers.Dropout(dropout)
-        self.pre_output = layers.Dense(hidden_size, activation='relu')
-        self.output_layer = layers.Dense(4, activation=None)  # Linear activation for regression
+    def _positional_encoding(self, d_model, max_length=1000):
+        angles = np.arange(max_length)[:, np.newaxis] / np.power(
+            10000, (2 * (np.arange(d_model)[np.newaxis, :] // 2)) / d_model
+        )
+        pos_encoding = np.zeros(angles.shape)
+        pos_encoding[:, 0::2] = np.sin(angles[:, 0::2])
+        pos_encoding[:, 1::2] = np.cos(angles[:, 1::2])
+        return tf.cast(pos_encoding[np.newaxis, ...], dtype=tf.float32)
         
     def call(self, inputs, training=False):
-        # Input projection
-        x = self.input_projection(inputs)
-        x = self.input_dropout(x, training=training)
+        x = self.input_layer(inputs)
+        x = x + self.pos_encoding[:, :tf.shape(inputs)[1], :]
         
-        # Add positional encoding
-        positions = tf.range(start=0, limit=tf.shape(x)[1], delta=1, dtype=tf.float32)
-        positions = tf.expand_dims(positions, axis=0)
-        positions = tf.tile(positions, [tf.shape(x)[0], 1])
-        positions = tf.expand_dims(positions, axis=-1)
-        
-        x = x + positions * 0.01
-        
-        # Transformer blocks
-        for block in self.transformer_blocks:
-            norm1, attn, drop1, norm2, ff1, drop2, ff2 = block
+        for i in range(0, len(self.transformer_layers), 3):
+            attn = self.transformer_layers[i](x, x, training=training)
+            x = self.transformer_layers[i+1](x + attn)
+            x = self.transformer_layers[i+2](x, training=training)
             
-            # Self-attention with residual connection
-            attended = norm1(x)
-            attended = attn(attended, attended)
-            attended = drop1(attended, training=training)
-            x = x + attended
-            
-            # Feed-forward with residual connection
-            ff_out = norm2(x)
-            ff_out = ff1(ff_out)
-            ff_out = drop2(ff_out, training=training)
-            ff_out = ff2(ff_out)
-            x = x + ff_out
-        
-        # Final output processing - değiştirildi
-        x = self.output_norm(x)
-        x = tf.reduce_mean(x, axis=1)  # Global average pooling
-        x = self.output_dropout(x, training=training)
-        x = self.pre_output(x)
-        return self.output_layer(x)  # Linear output for regression
+        return self.output_layer(x[:, -1, :])  # Son zaman adımının tahmini
 
 # Model ve scaler'ları saklamak için global sözlükler
 models = {}
 scalers = {}
-
-def egitim_verisi_hazirla(df, lookback=24):
-    """
-    Eğitim verisi hazırlama fonksiyonu
-    lookback: Kaç saat öncesine bakılacağı
-    """
-    features = []
-    targets = []
-    
-    for i in range(lookback, len(df)):
-        # Input özellikleri
-        window = df.iloc[i-lookback:i]
-        feature = np.column_stack((
-            window["Close"].values,
-            window["Volume"].values,
-            window["RSI"].values,
-            window["EMA_9"].values,
-            window["EMA_21"].values,
-            np.zeros(lookback),  # FinBERT score placeholder
-            np.zeros(lookback)   # AV score placeholder
-        ))
-        
-        # Hedef değerler (gelecek 4 saatin yüzdelik değişimleri)
-        if i + 4 <= len(df):
-            target = [
-                df["Return_1h"].iloc[i],
-                df["Return_2h"].iloc[i],
-                df["Return_3h"].iloc[i],
-                df["Return_4h"].iloc[i]
-            ]
-            
-            features.append(feature)
-            targets.append(target)
-    
-    return np.array(features), np.array(targets)
-
-def model_egit(hisse, epochs=50, batch_size=32):
-    """
-    Modeli eğitme fonksiyonu
-    """
-    try:
-        # Veriyi al
-        df = hisse_verisi_al(hisse, gun_sayisi=30)  # 30 günlük veri
-        if df is None or df.empty:
-            logger.error(f"{hisse} için eğitim verisi alınamadı")
-            return False
-            
-        # Eğitim verisi hazırla
-        X, y = egitim_verisi_hazirla(df)
-        if len(X) == 0 or len(y) == 0:
-            logger.error(f"{hisse} için yeterli eğitim verisi yok")
-            return False
-            
-        # Model ve scaler'ı al veya oluştur
-        model, scaler = model_yukle_veya_olustur(hisse)
-        
-        # Scaler'ı fit et
-        scaler.fit(X.reshape(-1, X.shape[-1]))
-        
-        # Verileri normalize et
-        X_scaled = np.array([scaler.transform(x) for x in X])
-        
-        # Modeli eğit
-        optimizer = keras.optimizers.legacy.Adam(learning_rate=0.001)  # Legacy optimizer kullan
-        loss = keras.losses.MeanSquaredError()
-        
-        model.compile(optimizer=optimizer, loss=loss, metrics=['mae'])
-        
-        # Early stopping ekle
-        early_stopping = keras.callbacks.EarlyStopping(
-            monitor='val_loss',
-            patience=5,
-            restore_best_weights=True
-        )
-        
-        # Learning rate azaltma
-        reduce_lr = keras.callbacks.ReduceLROnPlateau(
-            monitor='val_loss',
-            factor=0.2,
-            patience=3,
-            min_lr=0.0001
-        )
-        
-        history = model.fit(
-            X_scaled, y,
-            epochs=epochs,
-            batch_size=batch_size,
-            validation_split=0.2,
-            callbacks=[early_stopping, reduce_lr],
-            verbose=1
-        )
-        
-        # Modeli kaydet
-        models[hisse] = model
-        scalers[hisse] = scaler
-        
-        logger.info(f"{hisse} modeli başarıyla eğitildi")
-        return True
-        
-    except Exception as e:
-        logger.error(f"{hisse} modeli eğitilirken hata: {str(e)}")
-        return False
 
 def model_yukle_veya_olustur(hisse):
     if hisse not in models:
         input_size = 7  # Fiyat, Hacim, RSI, EMA9, EMA21, FinBERT score, AV score
         model = TimeSeriesPredictor(input_size)
         # Model'i build et
-        dummy_input = tf.random.uniform((1, 24, input_size))  # 24 saatlik pencere
+        dummy_input = tf.random.uniform((1, 1, input_size))
         _ = model(dummy_input)
         models[hisse] = model
         scalers[hisse] = MinMaxScaler()
@@ -452,45 +325,30 @@ def long_short_tavsiye(df):
     if df is None:
         return None
     try:
-        # Trend analizi (0 ile 1 arasında)
-        df["Trend_Score"] = (df["EMA_9"] > df["EMA_21"]).astype(float)
+        df["Trend"] = df["EMA_9"] > df["EMA_21"]
         
-        # Sentiment analizi (0 ile 1 arasında)
-        df["Sentiment_Score"] = ((df["Duygu"] == "positive").astype(float) * df["Duygu_Skor"] + 
-                               (df["AV_Duygu"] == "positive").astype(float) * df["AV_Duygu_Skor"]) / 2
+        # Sentiment ve teknik analizi birleştir
+        df["Sentiment_Positive"] = ((df["Duygu"] == "positive") | (df["AV_Duygu"] == "positive"))
         
-        # Tahmin analizi (tahminlerin ağırlıklı ortalaması)
-        weights = [0.4, 0.3, 0.2, 0.1]  # Yakın saatlere daha fazla ağırlık
-        df["Tahmin_Score"] = (df["Tahmin_1s"] * weights[0] + 
-                             df["Tahmin_2s"] * weights[1] + 
-                             df["Tahmin_3s"] * weights[2] + 
-                             df["Tahmin_4s"] * weights[3])
-        
-        # Final skor hesaplama (her faktörün ağırlıklı ortalaması)
-        df["Final_Score"] = (df["Trend_Score"] * 0.3 +  # Trend %30
-                           df["Sentiment_Score"] * 0.3 +  # Sentiment %30
-                           (df["Tahmin_Score"] > 0).astype(float) * 0.4)  # Tahmin %40
-        
-        # Tavsiye oluşturma
-        df["Tavsiye"] = df["Final_Score"].apply(
-            lambda x: "LONG" if x >= 0.6 else "SHORT" if x <= 0.4 else "NOTR"
+        # Tahminleri değerlendir
+        df["Tahmin_Trend"] = (df["Tahmin_1s"] + df["Tahmin_2s"] + df["Tahmin_3s"] + df["Tahmin_4s"]).apply(
+            lambda x: x > 0  # Toplam tahmin pozitifse True
         )
         
+        # Final tavsiye
+        df["Tavsiye"] = df.apply(lambda row: 
+            "LONG" if (row["Sentiment_Positive"] and row["Trend"] and row["Tahmin_Trend"]) 
+            else "SHORT", axis=1)
+            
         return df
     except Exception as e:
         logger.error(f"Tavsiye oluşturulurken hata: {str(e)}")
         return None
 
 # === 6️⃣ Modeli Çalıştırma ===
-def calistir(egitim_modu=False):
+def calistir():
     try:
         logger.info("Analiz başlatılıyor...")
-        
-        if egitim_modu:
-            logger.info("Model eğitimi başlatılıyor...")
-            for hisse in HISSELER:
-                model_egit(hisse)
-        
         df = model_calistir()
         if df is not None:
             df = long_short_tavsiye(df)
@@ -527,10 +385,6 @@ def otomatik_haber_guncelleme(guncelleme_suresi=3600):  # 1 saat
 
 if __name__ == "__main__":
     try:
-        # İlk çalıştırmada modelleri eğit
-        calistir(egitim_modu=True)
-        
-        # Sonra otomatik güncellemeye geç
         otomatik_haber_guncelleme()
     except Exception as e:
         logger.error(f"Program çalıştırılırken kritik hata: {str(e)}")
